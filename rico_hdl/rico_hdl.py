@@ -91,6 +91,25 @@ EUROSAT_MS_BANDS = [
 
 BIGEARTHNET_S1_ORDERING = ["VH", "VV"]
 
+# Same as BigEarthNet ordering
+# for whatever reason decided to use lower case here
+MAJOR_TOM_S1_ORDERING = ["vh", "vv"]
+
+MAJOR_TOM_S2_ORDERING = [
+    "B02",
+    "B03",
+    "B04",
+    "B08",
+    "B05",
+    "B06",
+    "B07",
+    "B8A",
+    "B11",
+    "B12",
+    "B01",
+    "B09",
+]
+
 NUM_HYSPECNET_BANDS = 224
 # see output of `gdalinfo`
 UC_MERCED_BAND_IDX_COLOR_MAPPING = {1: "Red", 2: "Green", 3: "Blue"}
@@ -142,24 +161,6 @@ def read_single_band_raster(path: Path, index: int = 1, is_georeferenced: bool =
         warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
     with rasterio.open(path) as r:
         return r.read(index)
-
-
-def bigearthnet_s2_to_safetensor(patch_path: str) -> bytes:
-    """
-    Given the path to a BigEarthNet-S2 patch directory
-    (NOT the individual TIFF files), read the individual
-    band files in a pre-defined order and convert it
-    into a serialized safetensor dictionary.
-    """
-    # In Python the dictionary insertion order is stable!
-    # order the data here to make it clear that we are doing it
-    # to order the safetensor entries!
-    p = Path(patch_path)
-    data = {
-        band: read_single_band_raster(p.joinpath(f"{p.stem}_{band}.tif"))
-        for band in BIGEARTHNET_S2_ORDERING
-    }
-    return save(data, metadata=None)
 
 
 def ssl4eo_s1_to_safetensor(patch_path: str) -> bytes:
@@ -230,6 +231,60 @@ def bigearthnet_s1_to_safetensor(patch_path: str) -> bytes:
     data = {
         band: read_single_band_raster(p.joinpath(f"{p.stem}_{band}.tif"))
         for band in BIGEARTHNET_S1_ORDERING
+    }
+    return save(data, metadata=None)
+
+
+def bigearthnet_s2_to_safetensor(patch_path: str) -> bytes:
+    """
+    Given the path to a BigEarthNet-S2 patch directory
+    (NOT the individual TIFF files), read the individual
+    band files in a pre-defined order and convert it
+    into a serialized safetensor dictionary.
+    """
+    # In Python the dictionary insertion order is stable!
+    # order the data here to make it clear that we are doing it
+    # to order the safetensor entries!
+    p = Path(patch_path)
+    data = {
+        band: read_single_band_raster(p.joinpath(f"{p.stem}_{band}.tif"))
+        for band in BIGEARTHNET_S2_ORDERING
+    }
+    return save(data, metadata=None)
+
+
+def major_tom_core_s1_to_safetensor(patch_path: str) -> bytes:
+    """
+    Given the path to a Major TOM Core S1 patch directory
+    (NOT the individual TIFF files), read the individual
+    band files in a pre-defined order and convert it
+    into a serialized safetensor dictionary.
+    """
+    # In Python the dictionary insertion order is stable!
+    # order the data here to make it clear that we are doing it
+    # to order the safetensor entries!
+    p = Path(patch_path)
+    data = {
+        band: read_single_band_raster(p.joinpath(f"{band}.tif"))
+        for band in MAJOR_TOM_S1_ORDERING
+    }
+    return save(data, metadata=None)
+
+
+def major_tom_core_s2_to_safetensor(patch_path: str) -> bytes:
+    """
+    Given the path to a Major TOM Core S2 patch directory
+    (NOT the individual TIFF files), read the individual
+    band files in a pre-defined order and convert it
+    into a serialized safetensor dictionary.
+    """
+    # In Python the dictionary insertion order is stable!
+    # order the data here to make it clear that we are doing it
+    # to order the safetensor entries!
+    p = Path(patch_path)
+    data = {
+        band: read_single_band_raster(p.joinpath(f"{band}.tif"))
+        for band in MAJOR_TOM_S2_ORDERING
     }
     return save(data, metadata=None)
 
@@ -339,6 +394,17 @@ def encode_stem(path: str) -> bytes:
 
 # yeah, this could be done more generic but it can still be refactored
 # if it is really needed in different variations.
+def encode_with_parent(path: str, join_char: str = "_") -> bytes:
+    """
+    Given a path that is at least one parent directory, concatenate the
+    directory name and the current file.
+
+    Example: `/home/user/patch/band` -> `patch_band`
+    """
+    p = Path(path)
+    return join_char.join([p.parent.name, p.name]).encode()
+
+
 def encode_three_levels(path: str, join_char: str = "_") -> bytes:
     """
     Given a path that is at least three levels deep, concatenate the names
@@ -482,6 +548,55 @@ def bigearthnet(
     if bigearthnet_s2_dir is not None:
         log.debug("Writing BigEarthNet-S2 data into LMDB")
         lmdb_writer(env, s2_patch_paths, encode_stem, bigearthnet_s2_to_safetensor)
+
+
+@app.command()
+def major_tom_core(
+    target_dir: TargetDir,
+    s1_dir: DatasetDir = None,
+    s2_dir: DatasetDir = None,
+):
+    """
+    [Major TOM Core S1 & S2](https://github.com/ESA-PhiLab/Major-TOM/tree/main) converter.
+
+    If both source directories are given, both of them will be written to the same LMDB file.
+    The LMDB keys will be the names of the patches (i.e., no band (`_BXY`) suffix).
+    The `safetensors` keys relate to the associate band (for example: `B01`, `B8A`, `B12`, `VV`).
+
+    NOTE: Requires the data to be downloaded via the [official download script](https://github.com/ESA-PhiLab/Major-TOM/blob/main/src/metadata_helpers.py).
+    NOTE: The `cloud_mask` is NOT encoded in the safetensor.
+    """
+    log.debug("Will first collect all files and ensure that some patches are found.")
+    if (s1_dir is None) and (s2_dir is None):
+        log.error("Please provide at least one directory path")
+        exit(-1, "No source directory is specified")
+
+    if s1_dir is not None:
+        log.info(f"Searching for patches in: {s1_dir}")
+        s1_patch_paths = fast_find(r"S1[AB]_IW_GRDH_.*_rtc$", s1_dir, only_dir=True)
+        num_s1_patch_paths = len(s1_patch_paths)
+        log.debug(f"Found {num_s1_patch_paths} S1 patches.")
+        assert num_s1_patch_paths > 0
+
+    if s2_dir is not None:
+        log.info(f"Seaching for patches in: {s2_dir}")
+        s2_patch_paths = fast_find(r"S2[AB]_MSIL2A_.*_[0-9T]+$", s2_dir, only_dir=True)
+        # contains the paths
+        num_s2_patch_paths = len(s2_patch_paths)
+        log.debug(f"Found {num_s2_patch_paths} S2 patches.")
+        assert num_s2_patch_paths > 0
+
+    # postpone writing until AFTER both dataset files have been assembled.
+    # Otherwise an error in the latter CLI argument could produce an incomplete LMDB
+    env = open_lmdb(target_dir)
+
+    if s1_dir is not None:
+        log.debug("Writing Major TOM Core S1 data into LMDB")
+        lmdb_writer(env, s1_patch_paths, encode_stem, major_tom_core_s1_to_safetensor)
+
+    if s2_dir is not None:
+        log.debug("Writing Major TOM Core data into LMDB")
+        lmdb_writer(env, s2_patch_paths, encode_stem, major_tom_core_s2_to_safetensor)
 
 
 @app.command()
